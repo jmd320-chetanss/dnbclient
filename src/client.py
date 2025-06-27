@@ -1,3 +1,4 @@
+from attrs import frozen
 import json
 import base64
 import time
@@ -5,32 +6,41 @@ import urllib
 from datetime import date
 from pyspark.sql import SparkSession
 from pyspark.sql.types import *
-
-API_KEY = "12345678910abcd"
-API_SECRET = "12345678910abcd"
-
-MINIMUM_CONFIDENCE = 5
-REGISTRATION_ID = "#############"
+import logging
+import requests
+from dataclasses import dataclass
+from typing import ClassVar
 
 
+@dataclass(frozen=True)
 class Client:
 
-    def __init__(self, spark: SparkSession, key: str, secret: str):
-        self.spark = spark
-        self.key = key
-        self.secret = secret
-        self.api_auth_url = "https://plus.dnb.com/v2/token"
-        self.api_url = "https://plus.dnb.com/v1"
-        self.auth_token = self.__define_auth_token()
-        self.matched_records = None
+    spark: SparkSession
+    key: str
+    secret: str
+    logger: logging.Logger = logging.getLogger("DNB Client")
+    minimum_confidence = 5
+    reg_id = ""
+
+    _api_auth_url: ClassVar[str] = "https://plus.dnb.com/v2/token"
+    _api_url: ClassVar[str] = "https://plus.dnb.com/v1"
+    _auth_token: ClassVar[str] = ""
+    _session_token: ClassVar[str] = ""
+
+    def __post_init__(self):
+
+        _auth_token = self.__define_auth_token()
 
         try:
-            self.session_token = self.__auth_proc()["access_token"]
-            print("Succesfully authenticated to the D&B API.")
+            _session_token = self.__auth_proc()["access_token"]
+            self.logger.info("Succesfully authenticated to the D&B API.")
         except Exception as error:
-            print(
+            self.logger.info(
                 "Authentication Error:\nWe could not authenticate to the D&B API. Please check your credentials."
             )
+
+        object.__setattr__(self, "_auth_token", _auth_token)
+        object.__setattr__(self, "_session_token", _session_token)
 
     schema = StructType(
         [
@@ -103,6 +113,7 @@ class Client:
         encoded_creds = base64.b64encode(str(key_sec).encode("ascii")).decode(
             "ascii"
         )  # Base 64 activation
+
         return encoded_creds
 
     def __auth_proc(self):
@@ -111,11 +122,12 @@ class Client:
         """
         payload = {"grant_type": "client_credentials"}
         headers = {
-            "Authorization": f"Basic {self.auth_token}",
+            "Authorization": f"Basic {self._auth_token}",
         }
         response = requests.request(
-            "POST", self.api_auth_url, headers=headers, json=payload
+            "POST", self._api_auth_url, headers=headers, json=payload
         )
+
         return response.json()
 
     def match_dnb(self, record):
@@ -124,7 +136,7 @@ class Client:
         For complete Match API details, please refer to our documentation website, https://directplus.documentation.dnb.com/openAPI.html?apiID=IDRCleanseMatch
         """
 
-        endpoint = f"{self.api_url}/match/cleanseMatch?"
+        endpoint = f"{self._api_url}/match/cleanseMatch?"
         params = {
             "candidateMaximumQuantity": 1,
             "name": record["name"],
@@ -137,19 +149,23 @@ class Client:
 
         payload = {}
         headers = {
-            "Authorization": f"Bearer {self.session_token}",
+            "Authorization": f"Bearer {self._session_token}",
         }
         params = urllib.parse.urlencode(params)
         url2 = endpoint + params
 
         response = requests.request("GET", url2, headers=headers, data=payload)
         json_resp = response.json()
+
         return json_resp
 
-    def match_and_cleanse(self, input_df, minimum_confidence=MINIMUM_CONFIDENCE):
+    def match_and_cleanse(self, input_df, minimum_confidence: int | None = None):
         """
         This method updates two object properties with dataframes. The first is a list of all the records that have a match confidence score of defined by the user (default is 7) or higher. The second is a list of all the records that have a match confidence score lower than the user defined score.
         """
+
+        if minimum_confidence is None:
+            minimum_confidence = self.minimum_confidence
 
         # check input minimum confidence value
         if minimum_confidence > 10:
@@ -210,7 +226,7 @@ class Client:
                 }
                 matched_records_list.append(matched_cos)
 
-        print(
+        self.logger.info(
             f"All records have been processed.\nThe result set is {len(matched_records_list)} records."
         )
 
@@ -221,15 +237,15 @@ class Client:
         This method will add the input dataframe to the monitoring endpoint. The reg_id is the unique identifier for the monitoring endpoint
         """
 
-        endpoint = f"{self.api_url}/monitoring/registrations/{reg_id}/subjects"
+        endpoint = f"{self._api_url}/monitoring/registrations/{reg_id}/subjects"
         payload = {}
         headers = {
-            "Authorization": f"Bearer {self.session_token}",
+            "Authorization": f"Bearer {self._session_token}",
         }
         response = requests.request("GET", endpoint, headers=headers)
         json_resp = response.json()
 
-        print(json_resp)
+        self.logger.info(json_resp)
 
     def add_to_monitoring(self, duns: str | list[str], reg_id: str) -> None:
         """
@@ -246,12 +262,10 @@ class Client:
         successfully_added_count = 0
 
         for duns in duns_list:
-            endpoint = (
-                f"{self.api_url}/monitoring/registrations/{reg_id}/duns/{duns}"
-            )
+            endpoint = f"{self._api_url}/monitoring/registrations/{reg_id}/duns/{duns}"
             payload = {}
             headers = {
-                "Authorization": f"Bearer {self.session_token}",
+                "Authorization": f"Bearer {self._session_token}",
             }
             url2 = endpoint
 
@@ -272,8 +286,7 @@ class Client:
             f"{successfully_added_count} were successfully added to monitoring."
         )
 
-        print(message)
-        return
+        self.logger.info(message)
 
     def delete_from_monitoring(self, duns: str | list[str], reg_id):
         """
@@ -287,19 +300,17 @@ class Client:
         duns_list = duns if isinstance(duns, list) else [duns]
 
         for duns in duns_list:
-            endpoint = (
-                f"{self.api_url}/monitoring/registrations/{reg_id}/duns/{duns}"
-            )
+            endpoint = f"{self._api_url}/monitoring/registrations/{reg_id}/duns/{duns}"
             payload = {}
             headers = {
-                "Authorization": f"Bearer {self.session_token}",
+                "Authorization": f"Bearer {self._session_token}",
             }
             url2 = endpoint
 
             response = requests.request("DELETE", url2, headers=headers)
             json_resp = response.json()
-            print(endpoint)
-            print(json_resp)
+            self.logger.info(endpoint)
+            self.logger.info(json_resp)
 
     def append_data(self, input_df):
         """
@@ -314,10 +325,10 @@ class Client:
             """
             Each ###BLOCK### needs to be replaced with client-specific Data Blocks, i.e., companyinfo_L2_v1
             """
-            endpoint = f"{self.api_url}/data/duns/{duns}?blockIDs=###BLOCK###%2C###BLOCK###%2C###BLOCK###"
+            endpoint = f"{self._api_url}/data/duns/{duns}?blockIDs=###BLOCK###%2C###BLOCK###%2C###BLOCK###"
             payload = {}
             headers = {
-                "Authorization": f"Bearer {self.session_token}",
+                "Authorization": f"Bearer {self._session_token}",
             }
             url2 = endpoint
 
@@ -337,15 +348,18 @@ class Client:
         )
         # message = (f"Processed {count} records."
 
-        return print(
+        self.logger.info(
             f"All records have been processed.\nThe result set is {len(append_records_list)} records which can be accessed using the appended_records object property"
         )
 
-    def adv_match_and_cleanse(self, input_df, minimum_confidence=MINIMUM_CONFIDENCE):
+    def adv_match_and_cleanse(self, input_df, minimum_confidence: int | None = None):
         """
         Processes each row in the input dataframe by matching it against D&B records
         and storing results with match details and confidence scores.
         """
+
+        if minimum_confidence is None:
+            minimum_confidence = self.minimum_confidence
 
         if not (1 <= minimum_confidence <= 10):
             raise ValueError("Minimum confidence must be between 1 and 10.")
@@ -389,13 +403,11 @@ class Client:
 
                 matched_records_list.append({**processed_match, **matched_cos})
 
-        self.matched_records = self.spark.createDataFrame(
-            matched_records_list, schema=self.schema
-        )
-
-        print(
+        self.logger.info(
             f"All records have been processed.\nThe result set contains {len(matched_records_list)} records and can be accessed via the matched_records object property."
         )
+
+        return self.spark.createDataFrame(matched_records_list, schema=self.schema)
 
     def processMatch(self, record, input_record):
         """
